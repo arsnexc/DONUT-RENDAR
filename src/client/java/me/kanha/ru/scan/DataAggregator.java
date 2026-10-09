@@ -78,8 +78,11 @@ public final class DataAggregator {
 
         int chunkX = client.player.chunkPosition().x + offsetX;
         int chunkZ = client.player.chunkPosition().z + offsetZ;
-        int y = Math.max(client.level.getMinBuildHeight(),
-            Math.min(client.level.getMaxBuildHeight() - 1, client.player.blockPosition().getY()));
+        // 1.21.11 renamed the LevelHeightAccessor height APIs:
+        // getMinBuildHeight() -> getMinY(), getMaxBuildHeight() -> getMaxY()
+        // (getMaxY() is already the inclusive top block, so no -1 adjustment).
+        int y = Math.max(client.level.getMinY(),
+            Math.min(client.level.getMaxY(), client.player.blockPosition().getY()));
         BlockPos probe = new BlockPos(chunkX * 16 + 8, y, chunkZ * 16 + 8);
 
         // hasChunkAt checks the client cache; do not force-load chunks to scan them.
@@ -120,7 +123,7 @@ public final class DataAggregator {
                 continue;
             }
 
-            int baseY = chunk.getMinSection() * 16 + sectionIndex * 16;
+            int baseY = chunk.getMinSectionY() * 16 + sectionIndex * 16;
             for (int x = 0; x < 16; x++) {
                 for (int y = 0; y < 16; y++) {
                     for (int z = 0; z < 16; z++) {
