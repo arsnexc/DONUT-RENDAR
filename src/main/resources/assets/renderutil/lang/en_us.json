@@ -1,0 +1,7 @@
+{
+  "key.category.renderutil.main": "RenderUtil",
+  "key.renderutil.gui": "Open Click GUI",
+  "key.renderutil.search": "Open Block Search",
+  "key.renderutil.panic": "Panic (Disable All)",
+  "renderutil.singleplayer_only": "RenderUtil scan modules only work in a local single-player world."
+}
