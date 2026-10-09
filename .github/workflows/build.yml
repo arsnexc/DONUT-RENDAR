@@ -28,7 +28,26 @@ jobs:
         run: chmod +x ./gradlew
 
       - name: Build mod
-        run: ./gradlew --no-daemon build
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon build 2>&1 | tee build-output.log
+
+      - name: Surface build log on failure
+        if: failure()
+        run: |
+          # Emit the tail of the Gradle build log as workflow annotations so a
+          # failing build can be diagnosed without downloading the full logs.
+          if [ -f build-output.log ]; then
+            tail -n 200 build-output.log \
+              | sed -e 's/%/%25/g' -e 's/\r/%0D/g' \
+              | awk '{ printf "%s%%0A", $0 }' > build-output.encoded
+            split -b 3000 build-output.encoded build-output.part_
+            index=0
+            for part in build-output.part_*; do
+              index=$((index + 1))
+              echo "::error title=Gradle build log (chunk ${index})::$(cat "$part")"
+            done
+          fi
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
