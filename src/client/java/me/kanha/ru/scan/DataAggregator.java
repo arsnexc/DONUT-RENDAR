@@ -70,6 +70,7 @@ public final class DataAggregator {
     private static BlockPos lastSearchPruneOrigin;
     private static double lastSearchPruneRange = Double.NaN;
     private static int lastSearchSelectionRevision = Integer.MIN_VALUE;
+    private static volatile long resultRevision;
 
     private DataAggregator() {
     }
@@ -201,6 +202,7 @@ public final class DataAggregator {
         double searchRangeSquared = searchModule == null ? 0.0 : searchModule.getRange() * searchModule.getRange();
         boolean scanActivity = isEnabled("Activity Scan");
         if (!scanContainers && !scanSpawners && !scanSearch && !scanActivity) {
+            resultRevision++;
             return;
         }
 
@@ -270,6 +272,7 @@ public final class DataAggregator {
         if (scanActivity && hottestSectionCenter != null) {
             heatMap.put(hottestSectionCenter, (float) hottestSectionCount);
         }
+        resultRevision++;
     }
 
     private static boolean isActivityIndicator(BlockState state, Block block) {
@@ -304,7 +307,10 @@ public final class DataAggregator {
         Module searchBase = ModuleManager.getByName("Block Search");
         if (!(searchBase instanceof BlockSearchModule searchModule)
             || !searchModule.isEnabled() || BlockSearchModule.searchBlocks.isEmpty()) {
-            BlockSearchModule.clearFound();
+            if (!BlockSearchModule.foundBlocks.isEmpty()) {
+                BlockSearchModule.clearFound();
+                resultRevision++;
+            }
             lastSearchPruneOrigin = null;
             lastSearchPruneRange = Double.NaN;
             lastSearchSelectionRevision = Integer.MIN_VALUE;
@@ -322,7 +328,7 @@ public final class DataAggregator {
         }
 
         double rangeSquared = range * range;
-        BlockSearchModule.foundBlocks.removeIf(pos -> {
+        boolean changed = BlockSearchModule.foundBlocks.removeIf(pos -> {
             if (playerPos.distSqr(pos) > rangeSquared) {
                 return true;
             }
@@ -332,6 +338,9 @@ public final class DataAggregator {
             return selectionChanged && (!client.level.hasChunkAt(pos)
                 || !BlockSearchModule.shouldTrack(client.level.getBlockState(pos).getBlock()));
         });
+        if (changed) {
+            resultRevision++;
+        }
 
         lastSearchPruneOrigin = playerPos;
         lastSearchPruneRange = range;
@@ -339,17 +348,27 @@ public final class DataAggregator {
     }
 
     private static void removeChunkResults(int chunkX, int chunkZ) {
-        trackedContainers.removeIf(pos -> (pos.getX() >> 4) == chunkX && (pos.getZ() >> 4) == chunkZ);
-        trackedSpawners.removeIf(pos -> (pos.getX() >> 4) == chunkX && (pos.getZ() >> 4) == chunkZ);
-        BlockSearchModule.foundBlocks.removeIf(pos -> (pos.getX() >> 4) == chunkX && (pos.getZ() >> 4) == chunkZ);
-        heatMap.keySet().removeIf(pos -> (pos.getX() >> 4) == chunkX && (pos.getZ() >> 4) == chunkZ);
+        boolean changed = trackedContainers.removeIf(
+            pos -> (pos.getX() >> 4) == chunkX && (pos.getZ() >> 4) == chunkZ);
+        changed |= trackedSpawners.removeIf(
+            pos -> (pos.getX() >> 4) == chunkX && (pos.getZ() >> 4) == chunkZ);
+        changed |= BlockSearchModule.foundBlocks.removeIf(
+            pos -> (pos.getX() >> 4) == chunkX && (pos.getZ() >> 4) == chunkZ);
+        changed |= heatMap.keySet().removeIf(
+            pos -> (pos.getX() >> 4) == chunkX && (pos.getZ() >> 4) == chunkZ);
+        if (changed) {
+            resultRevision++;
+        }
     }
 
     private static void pruneResultsOutsideScanWindow(int centerX, int centerZ, int radius) {
-        trackedContainers.removeIf(pos -> !withinChunkRadius(pos, centerX, centerZ, radius));
-        trackedSpawners.removeIf(pos -> !withinChunkRadius(pos, centerX, centerZ, radius));
-        BlockSearchModule.foundBlocks.removeIf(pos -> !withinChunkRadius(pos, centerX, centerZ, radius));
-        heatMap.keySet().removeIf(pos -> !withinChunkRadius(pos, centerX, centerZ, radius));
+        boolean changed = trackedContainers.removeIf(pos -> !withinChunkRadius(pos, centerX, centerZ, radius));
+        changed |= trackedSpawners.removeIf(pos -> !withinChunkRadius(pos, centerX, centerZ, radius));
+        changed |= BlockSearchModule.foundBlocks.removeIf(pos -> !withinChunkRadius(pos, centerX, centerZ, radius));
+        changed |= heatMap.keySet().removeIf(pos -> !withinChunkRadius(pos, centerX, centerZ, radius));
+        if (changed) {
+            resultRevision++;
+        }
     }
 
     private static boolean withinChunkRadius(BlockPos pos, int centerX, int centerZ, int radius) {
@@ -358,17 +377,25 @@ public final class DataAggregator {
     }
 
     private static void clearDisabledModuleData() {
+        boolean changed = false;
         if (!isEnabled("Container ESP")) {
+            changed |= !trackedContainers.isEmpty();
             trackedContainers.clear();
         }
         if (!isEnabled("Spawner ESP")) {
+            changed |= !trackedSpawners.isEmpty();
             trackedSpawners.clear();
         }
         if (!isEnabled("Block Search")) {
+            changed |= !BlockSearchModule.foundBlocks.isEmpty();
             BlockSearchModule.clearFound();
         }
         if (!isEnabled("Activity Scan")) {
+            changed |= !heatMap.isEmpty();
             heatMap.clear();
+        }
+        if (changed) {
+            resultRevision++;
         }
     }
 
@@ -412,6 +439,7 @@ public final class DataAggregator {
         trackedSpawners.clear();
         heatMap.clear();
         BlockSearchModule.clearFound();
+        resultRevision++;
         resetScanPlan();
         scanningWasActive = false;
         lastSearchPruneOrigin = null;
@@ -430,6 +458,11 @@ public final class DataAggregator {
     /** Number of chunks visited at least once for the current center/radius. */
     public static int getVisitedChunkCount() {
         return visitedChunkCount;
+    }
+
+    /** Changes when scan results are refreshed, pruned, or cleared. */
+    public static long getResultRevision() {
+        return resultRevision;
     }
 
     public static void clear() {

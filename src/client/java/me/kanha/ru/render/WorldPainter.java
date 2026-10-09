@@ -40,6 +40,11 @@ public final class WorldPainter {
         .thenComparingInt(candidate -> candidate.position().getY())
         .thenComparingInt(candidate -> candidate.position().getZ());
 
+    private static final MarkerCache CONTAINER_CACHE = new MarkerCache();
+    private static final MarkerCache SPAWNER_CACHE = new MarkerCache();
+    private static final MarkerCache SEARCH_CACHE = new MarkerCache();
+    private static final MarkerCache ACTIVITY_CACHE = new MarkerCache();
+
     private WorldPainter() {
     }
 
@@ -80,8 +85,8 @@ public final class WorldPainter {
             Module containerBase = ModuleManager.getByName("Container ESP");
             if (containerBase instanceof ContainerEspModule container
                 && container.isEnabled() && container.shouldHighlight()) {
-                drawPositions(fillVertices, outlineVertices, matrices, DataAggregator.trackedContainers,
-                    ARGB.colorFromFloat(0.16f, 1.0f, 0.20f, 0.20f),
+                drawPositions(fillVertices, outlineVertices, matrices, CONTAINER_CACHE,
+                    DataAggregator.trackedContainers, ARGB.colorFromFloat(0.16f, 1.0f, 0.20f, 0.20f),
                     ARGB.colorFromFloat(1.0f, 1.0f, 0.28f, 0.28f),
                     client.player.blockPosition());
             }
@@ -89,8 +94,8 @@ public final class WorldPainter {
             Module spawnerBase = ModuleManager.getByName("Spawner ESP");
             if (spawnerBase instanceof SpawnerEspModule spawner
                 && spawner.isEnabled() && spawner.shouldHighlight()) {
-                drawPositions(fillVertices, outlineVertices, matrices, DataAggregator.trackedSpawners,
-                    ARGB.colorFromFloat(0.17f, 1.0f, 0.78f, 0.16f),
+                drawPositions(fillVertices, outlineVertices, matrices, SPAWNER_CACHE,
+                    DataAggregator.trackedSpawners, ARGB.colorFromFloat(0.17f, 1.0f, 0.78f, 0.16f),
                     ARGB.colorFromFloat(1.0f, 1.0f, 0.90f, 0.28f),
                     client.player.blockPosition());
             }
@@ -98,8 +103,8 @@ public final class WorldPainter {
             Module searchBase = ModuleManager.getByName("Block Search");
             if (searchBase instanceof BlockSearchModule search
                 && search.isEnabled() && search.shouldHighlight()) {
-                drawPositions(fillVertices, outlineVertices, matrices, BlockSearchModule.foundBlocks,
-                    ARGB.colorFromFloat(0.16f, 0.22f, 0.58f, 1.0f),
+                drawPositions(fillVertices, outlineVertices, matrices, SEARCH_CACHE,
+                    BlockSearchModule.foundBlocks, ARGB.colorFromFloat(0.16f, 0.22f, 0.58f, 1.0f),
                     ARGB.colorFromFloat(1.0f, 0.38f, 0.72f, 1.0f),
                     client.player.blockPosition());
             }
@@ -108,7 +113,7 @@ public final class WorldPainter {
             if (activityBase instanceof ActivityScanModule activity && activity.isEnabled()) {
                 BlockPos playerPos = client.player.blockPosition();
                 for (MarkerCandidate candidate : nearestHotspots(
-                    DataAggregator.heatMap, playerPos, activity.getThreshold())) {
+                    ACTIVITY_CACHE, DataAggregator.heatMap, playerPos, activity.getThreshold())) {
                     float score = DataAggregator.heatMap.getOrDefault(candidate.position(), 0.0f);
                     if (score < activity.getThreshold()) {
                         continue;
@@ -127,10 +132,11 @@ public final class WorldPainter {
     }
 
     private static void drawPositions(VertexConsumer fillVertices, VertexConsumer outlineVertices,
-                                      PoseStack matrices, Set<BlockPos> positions,
+                                      PoseStack matrices, MarkerCache cache, Set<BlockPos> positions,
                                       int fillColor, int outlineColor, BlockPos origin) {
-        for (BlockPos pos : nearestPositions(positions, origin)) {
-            drawMarker(fillVertices, outlineVertices, matrices, new AABB(pos), fillColor, outlineColor);
+        for (MarkerCandidate candidate : nearestPositions(cache, positions, origin)) {
+            drawMarker(fillVertices, outlineVertices, matrices,
+                new AABB(candidate.position()), fillColor, outlineColor);
         }
     }
 
@@ -140,7 +146,15 @@ public final class WorldPainter {
         drawOutline(outlineVertices, matrices, box, outlineColor);
     }
 
-    private static List<BlockPos> nearestPositions(Set<BlockPos> positions, BlockPos origin) {
+    // Search results can be large (for example, a common block type). Cache the
+    // bounded nearest-first snapshot so repeated render frames do not rescan it.
+    private static List<MarkerCandidate> nearestPositions(MarkerCache cache,
+                                                           Set<BlockPos> positions, BlockPos origin) {
+        long revision = DataAggregator.getResultRevision();
+        if (cache.matches(revision, origin, Float.NaN)) {
+            return cache.candidates();
+        }
+
         PriorityQueue<MarkerCandidate> nearest = newNearestQueue();
         for (BlockPos pos : positions) {
             double distanceSquared = origin.distSqr(pos);
@@ -148,11 +162,16 @@ public final class WorldPainter {
                 keepNearest(nearest, new MarkerCandidate(pos, distanceSquared));
             }
         }
-        return sortedPositions(nearest);
+        return cache.store(revision, origin, Float.NaN, sortedCandidates(nearest));
     }
 
-    private static List<MarkerCandidate> nearestHotspots(Map<BlockPos, Float> heatMap,
+    private static List<MarkerCandidate> nearestHotspots(MarkerCache cache, Map<BlockPos, Float> heatMap,
                                                           BlockPos origin, float threshold) {
+        long revision = DataAggregator.getResultRevision();
+        if (cache.matches(revision, origin, threshold)) {
+            return cache.candidates();
+        }
+
         PriorityQueue<MarkerCandidate> nearest = newNearestQueue();
         for (Map.Entry<BlockPos, Float> entry : heatMap.entrySet()) {
             if (entry.getValue() < threshold) {
@@ -163,10 +182,7 @@ public final class WorldPainter {
                 keepNearest(nearest, new MarkerCandidate(entry.getKey(), distanceSquared));
             }
         }
-
-        ArrayList<MarkerCandidate> result = new ArrayList<>(nearest);
-        result.sort(NEAREST_FIRST);
-        return result;
+        return cache.store(revision, origin, threshold, sortedCandidates(nearest));
     }
 
     private static PriorityQueue<MarkerCandidate> newNearestQueue() {
@@ -182,10 +198,10 @@ public final class WorldPainter {
         }
     }
 
-    private static List<BlockPos> sortedPositions(PriorityQueue<MarkerCandidate> candidates) {
+    private static List<MarkerCandidate> sortedCandidates(PriorityQueue<MarkerCandidate> candidates) {
         ArrayList<MarkerCandidate> sorted = new ArrayList<>(candidates);
         sorted.sort(NEAREST_FIRST);
-        return sorted.stream().map(MarkerCandidate::position).toList();
+        return List.copyOf(sorted);
     }
 
     private static void drawOutline(VertexConsumer vertices, PoseStack matrices, AABB box, int color) {
@@ -284,5 +300,30 @@ public final class WorldPainter {
     }
 
     private record MarkerCandidate(BlockPos position, double distanceSquared) {
+    }
+
+    private static final class MarkerCache {
+        private long revision = Long.MIN_VALUE;
+        private BlockPos origin;
+        private float threshold = Float.NaN;
+        private List<MarkerCandidate> candidates = List.of();
+
+        private boolean matches(long revision, BlockPos origin, float threshold) {
+            return this.revision == revision && origin.equals(this.origin)
+                && Float.compare(this.threshold, threshold) == 0;
+        }
+
+        private List<MarkerCandidate> candidates() {
+            return candidates;
+        }
+
+        private List<MarkerCandidate> store(long revision, BlockPos origin, float threshold,
+                                            List<MarkerCandidate> candidates) {
+            this.revision = revision;
+            this.origin = origin;
+            this.threshold = threshold;
+            this.candidates = candidates;
+            return candidates;
+        }
     }
 }
