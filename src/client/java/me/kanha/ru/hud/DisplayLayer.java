@@ -77,6 +77,13 @@ public final class DisplayLayer {
             }
         }
 
+        graphics.drawString(client.font,
+            String.format("Scan coverage: %d/%d chunks loaded; %d visited",
+                DataAggregator.getLoadedChunkCount(), DataAggregator.getTotalChunkCount(),
+                DataAggregator.getVisitedChunkCount()),
+            x, y, 0xFFCCCCCC, true);
+        y += lineHeight;
+
         BlockPos nearest = getNearestMarker(client);
         if (nearest != null) {
             double distance = client.player.position().distanceTo(Vec3.atCenterOf(nearest));
