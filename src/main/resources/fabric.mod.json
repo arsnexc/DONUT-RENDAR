@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "renderutil",
+  "version": "${version}",
+  "name": "RenderUtil",
+  "description": "A single-player client utility and world-inspection mod.",
+  "authors": ["Kanha"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["me.kanha.ru.RenderUtilClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
