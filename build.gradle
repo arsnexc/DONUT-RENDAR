@@ -29,10 +29,14 @@ dependencies {
 }
 
 processResources {
-    inputs.property "version", project.version
+    // Capture the version at configuration time: referencing `project` inside
+    // the filesMatching closure would break the configuration cache at execution
+    // time (org.gradle.configuration-cache=true).
+    def version = project.version
+    inputs.property "version", version
 
     filesMatching('fabric.mod.json') {
-        expand 'version': project.version
+        expand 'version': version
     }
 }
 
