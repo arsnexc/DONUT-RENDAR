@@ -145,10 +145,10 @@ public final class BlockSearchScreen extends Screen {
             }
             matching.add(pos);
         }
-        matching.sort(Comparator.comparingDouble(origin::distSqr)
-            .thenComparingInt(BlockPos::getX)
-            .thenComparingInt(BlockPos::getY)
-            .thenComparingInt(BlockPos::getZ));
+        matching.sort(Comparator.comparingDouble((BlockPos pos) -> origin.distSqr(pos))
+            .thenComparingInt(pos -> pos.getX())
+            .thenComparingInt(pos -> pos.getY())
+            .thenComparingInt(pos -> pos.getZ()));
         nearbyResults.addAll(matching.subList(0, Math.min(matching.size(), MAX_COORDINATE_RESULTS)));
         if (nearbyResults.isEmpty()) {
             coordinateIndex = 0;
