@@ -1,10 +1,10 @@
 package me.kanha.ru.module;
 
 public final class ContainerEspModule extends Module {
-    private final BooleanSetting highlight = new BooleanSetting("Highlight", true);
+    private final BooleanSetting highlight = new BooleanSetting("Highlight", "highlight", true);
 
     public ContainerEspModule() {
-        super("Container ESP", Category.RENDER);
+        super("container_esp", "Container ESP", Category.RENDER);
         addSetting(highlight);
     }
 

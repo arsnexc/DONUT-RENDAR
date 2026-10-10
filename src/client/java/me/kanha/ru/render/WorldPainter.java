@@ -3,6 +3,7 @@ package me.kanha.ru.render;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import me.kanha.ru.RenderUtilClient;
+import me.kanha.ru.config.Settings;
 import me.kanha.ru.module.ActivityScanModule;
 import me.kanha.ru.module.BlockSearchModule;
 import me.kanha.ru.module.ContainerEspModule;
@@ -31,7 +32,6 @@ import java.util.Set;
 public final class WorldPainter {
     private static final int MAX_MARKERS_PER_MODULE = 200;
     private static final double MAX_MARKER_DISTANCE_SQUARED = 96.0 * 96.0;
-    private static final double OUTLINE_THICKNESS = 0.035;
     private static final int FULL_BRIGHT_LIGHT = 0x00F000F0;
 
     private static final Comparator<MarkerCandidate> NEAREST_FIRST = Comparator
@@ -77,40 +77,35 @@ public final class WorldPainter {
             matrices.translate(-camera.x, -camera.y, -camera.z);
 
             VertexConsumer fillVertices = context.consumers().getBuffer(RenderTypes.debugFilledBox());
-            // This vanilla see-through layer has depth testing and depth writes
-            // disabled. Thin double-sided bars keep marker outlines legible behind
-            // blocks and when the camera is inside a marker volume.
-            VertexConsumer outlineVertices = context.consumers().getBuffer(RenderTypes.textBackgroundSeeThrough());
 
             Module containerBase = ModuleManager.getByName("Container ESP");
             if (containerBase instanceof ContainerEspModule container
                 && container.isEnabled() && container.shouldHighlight()) {
-                drawPositions(fillVertices, outlineVertices, matrices, CONTAINER_CACHE,
-                    DataAggregator.trackedContainers, ARGB.colorFromFloat(0.16f, 1.0f, 0.20f, 0.20f),
-                    ARGB.colorFromFloat(1.0f, 1.0f, 0.28f, 0.28f),
-                    client.player.blockPosition());
+                Settings.MarkerStyle style = Settings.markerStyle("container_esp");
+                drawPositions(fillVertices, outlineVertices(context, style), matrices, CONTAINER_CACHE,
+                    DataAggregator.trackedContainers, style, client.player.blockPosition());
             }
 
             Module spawnerBase = ModuleManager.getByName("Spawner ESP");
             if (spawnerBase instanceof SpawnerEspModule spawner
                 && spawner.isEnabled() && spawner.shouldHighlight()) {
-                drawPositions(fillVertices, outlineVertices, matrices, SPAWNER_CACHE,
-                    DataAggregator.trackedSpawners, ARGB.colorFromFloat(0.17f, 1.0f, 0.78f, 0.16f),
-                    ARGB.colorFromFloat(1.0f, 1.0f, 0.90f, 0.28f),
-                    client.player.blockPosition());
+                Settings.MarkerStyle style = Settings.markerStyle("spawner_esp");
+                drawPositions(fillVertices, outlineVertices(context, style), matrices, SPAWNER_CACHE,
+                    DataAggregator.trackedSpawners, style, client.player.blockPosition());
             }
 
             Module searchBase = ModuleManager.getByName("Block Search");
             if (searchBase instanceof BlockSearchModule search
                 && search.isEnabled() && search.shouldHighlight()) {
-                drawPositions(fillVertices, outlineVertices, matrices, SEARCH_CACHE,
-                    BlockSearchModule.foundBlocks, ARGB.colorFromFloat(0.16f, 0.22f, 0.58f, 1.0f),
-                    ARGB.colorFromFloat(1.0f, 0.38f, 0.72f, 1.0f),
-                    client.player.blockPosition());
+                Settings.MarkerStyle style = Settings.markerStyle("block_search");
+                drawPositions(fillVertices, outlineVertices(context, style), matrices, SEARCH_CACHE,
+                    BlockSearchModule.foundBlocks, style, client.player.blockPosition());
             }
 
             Module activityBase = ModuleManager.getByName("Activity Scan");
             if (activityBase instanceof ActivityScanModule activity && activity.isEnabled()) {
+                Settings.MarkerStyle style = Settings.markerStyle("activity_scan");
+                VertexConsumer activityOutline = outlineVertices(context, style);
                 BlockPos playerPos = client.player.blockPosition();
                 for (MarkerCandidate candidate : nearestHotspots(
                     ACTIVITY_CACHE, DataAggregator.heatMap, playerPos, activity.getThreshold())) {
@@ -118,12 +113,9 @@ public final class WorldPainter {
                     if (score < activity.getThreshold()) {
                         continue;
                     }
-                    float red = Math.min(1.0f, score / 20.0f);
-                    float blue = 1.0f - red;
-                    drawMarker(fillVertices, outlineVertices, matrices,
+                    drawMarker(fillVertices, activityOutline, matrices,
                         new AABB(candidate.position()).inflate(0.5),
-                        ARGB.colorFromFloat(0.16f, red, 0.75f, blue),
-                        ARGB.colorFromFloat(1.0f, Math.max(0.25f, red), 0.90f, Math.max(0.25f, blue)));
+                        fillColor(style), outlineColor(style), style.outlineWidth);
                 }
             }
         } finally {
@@ -131,19 +123,42 @@ public final class WorldPainter {
         }
     }
 
+    private static VertexConsumer outlineVertices(WorldRenderContext context, Settings.MarkerStyle style) {
+        // Through-wall rendering is a local visual preference. The alternate
+        // vanilla layer uses normal depth testing when the option is disabled.
+        return context.consumers().getBuffer(style.throughWalls
+            ? RenderTypes.textBackgroundSeeThrough() : RenderTypes.debugFilledBox());
+    }
+
     private static void drawPositions(VertexConsumer fillVertices, VertexConsumer outlineVertices,
                                       PoseStack matrices, MarkerCache cache, Set<BlockPos> positions,
-                                      int fillColor, int outlineColor, BlockPos origin) {
+                                      Settings.MarkerStyle style, BlockPos origin) {
         for (MarkerCandidate candidate : nearestPositions(cache, positions, origin)) {
             drawMarker(fillVertices, outlineVertices, matrices,
-                new AABB(candidate.position()), fillColor, outlineColor);
+                new AABB(candidate.position()), fillColor(style), outlineColor(style), style.outlineWidth);
         }
     }
 
     private static void drawMarker(VertexConsumer fillVertices, VertexConsumer outlineVertices,
-                                   PoseStack matrices, AABB box, int fillColor, int outlineColor) {
+                                   PoseStack matrices, AABB box, int fillColor, int outlineColor,
+                                   double outlineWidth) {
         drawBox(fillVertices, matrices, box, fillColor, false, false);
-        drawOutline(outlineVertices, matrices, box, outlineColor);
+        drawOutline(outlineVertices, matrices, box, outlineColor, outlineWidth);
+    }
+
+    private static int fillColor(Settings.MarkerStyle style) {
+        return colorWithOpacity(style.fillColor, (float) style.fillOpacity);
+    }
+
+    private static int outlineColor(Settings.MarkerStyle style) {
+        return colorWithOpacity(style.outlineColor, 1.0f);
+    }
+
+    private static int colorWithOpacity(int color, float opacity) {
+        float red = ((color >> 16) & 0xFF) / 255.0f;
+        float green = ((color >> 8) & 0xFF) / 255.0f;
+        float blue = (color & 0xFF) / 255.0f;
+        return ARGB.colorFromFloat(Math.max(0.0f, Math.min(1.0f, opacity)), red, green, blue);
     }
 
     // Search results can be large (for example, a common block type). Cache the
@@ -204,8 +219,8 @@ public final class WorldPainter {
         return List.copyOf(sorted);
     }
 
-    private static void drawOutline(VertexConsumer vertices, PoseStack matrices, AABB box, int color) {
-        double thickness = OUTLINE_THICKNESS;
+    private static void drawOutline(VertexConsumer vertices, PoseStack matrices, AABB box,
+                                    int color, double thickness) {
         double minX = box.minX;
         double minY = box.minY;
         double minZ = box.minZ;

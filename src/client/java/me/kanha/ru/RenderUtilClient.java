@@ -25,6 +25,7 @@ public final class RenderUtilClient implements ClientModInitializer {
     public void onInitializeClient() {
         Settings.load();
         ModuleManager.init();
+        Settings.applyToModules();
         WorldPainter.init();
         DisplayLayer.init();
 

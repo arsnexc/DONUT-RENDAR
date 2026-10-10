@@ -1,21 +1,24 @@
 package me.kanha.ru.module;
 
+import me.kanha.ru.scan.DataAggregator;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.block.Block;
 
+import java.util.Collection;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class BlockSearchModule extends Module {
     public static final Set<Block> searchBlocks = ConcurrentHashMap.newKeySet();
-    public static final Set<BlockPos> foundBlocks = ConcurrentHashMap.newKeySet();
+    /** Read-only view of the chunk-indexed result set maintained by DataAggregator. */
+    public static final Set<BlockPos> foundBlocks = DataAggregator.getSearchResults();
     private static int selectionRevision;
 
-    private final BooleanSetting highlight = new BooleanSetting("Highlight", true);
-    private final NumberSetting range = new NumberSetting("Range", 64, 16, 256, 16);
+    private final BooleanSetting highlight = new BooleanSetting("Highlight", "highlight", true);
+    private final NumberSetting range = new NumberSetting("Range", "range", 64, 16, 256, 16);
 
     public BlockSearchModule() {
-        super("Block Search", Category.SEARCH);
+        super("block_search", "Block Search", Category.SEARCH);
         addSetting(highlight);
         addSetting(range);
     }
@@ -49,11 +52,21 @@ public final class BlockSearchModule extends Module {
         }
     }
 
+    public static void replaceSelection(Collection<Block> blocks) {
+        Set<Block> replacement = ConcurrentHashMap.newKeySet();
+        replacement.addAll(blocks);
+        if (!searchBlocks.equals(replacement)) {
+            searchBlocks.clear();
+            searchBlocks.addAll(replacement);
+            selectionRevision++;
+        }
+    }
+
     public static int getSelectionRevision() {
         return selectionRevision;
     }
 
     public static void clearFound() {
-        foundBlocks.clear();
+        DataAggregator.clearSearchResults();
     }
 }

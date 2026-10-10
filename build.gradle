@@ -28,6 +28,27 @@ dependencies {
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 }
 
+// Dependency-free regression harness for the pure scan-window/result-pruning logic.
+sourceSets {
+    regressionTest {
+        java.srcDir 'src/regressionTest/java'
+        compileClasspath += sourceSets.client.output + sourceSets.client.compileClasspath
+        runtimeClasspath += sourceSets.client.output + sourceSets.client.runtimeClasspath
+    }
+}
+
+tasks.register('regressionTest', JavaExec) {
+    group = 'verification'
+    description = 'Runs RenderUtil scan ordering, coverage, pruning, and world-change regression checks.'
+    dependsOn tasks.named('regressionTestClasses')
+    classpath = sourceSets.regressionTest.runtimeClasspath
+    mainClass = 'me.kanha.ru.scan.ScanRegressionTests'
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('regressionTest')
+}
+
 processResources {
     // Capture the version at configuration time: referencing `project` inside
     // the filesMatching closure would break the configuration cache at execution
