@@ -17,7 +17,10 @@ not proof that a player is or was present.
 
 ## Build and regression checks
 
-Use Java 21 and run:
+The mod targets Java 21 and declares Java 21 as its minimum runtime. The current
+Loom `1.18-SNAPSHOT` resolves to a build plugin that requires Java 25 to run
+Gradle, so use JDK 25 for the build (as the workflow does); the compiled mod
+still uses `--release 21`. Then run:
 
 ```sh
 ./gradlew build
