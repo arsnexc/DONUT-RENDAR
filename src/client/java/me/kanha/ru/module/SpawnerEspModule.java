@@ -1,10 +1,10 @@
 package me.kanha.ru.module;
 
 public final class SpawnerEspModule extends Module {
-    private final BooleanSetting highlight = new BooleanSetting("Highlight", true);
+    private final BooleanSetting highlight = new BooleanSetting("Highlight", "highlight", true);
 
     public SpawnerEspModule() {
-        super("Spawner ESP", Category.RENDER);
+        super("spawner_esp", "Spawner ESP", Category.RENDER);
         addSetting(highlight);
     }
 

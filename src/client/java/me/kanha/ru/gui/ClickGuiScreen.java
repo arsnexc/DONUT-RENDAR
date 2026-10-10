@@ -4,6 +4,8 @@ import me.kanha.ru.RenderUtilClient;
 import me.kanha.ru.config.Settings;
 import me.kanha.ru.module.Module;
 import me.kanha.ru.module.ModuleManager;
+import me.kanha.ru.scan.DataAggregator;
+import me.kanha.ru.scan.ScanWindow;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.screens.Screen;
@@ -18,6 +20,7 @@ public final class ClickGuiScreen extends Screen {
     private static final int PANEL_WIDTH = 190;
     private static final int HEADER_HEIGHT = 24;
     private static final int MODULE_HEIGHT = 19;
+    private static final int COVERAGE_HEIGHT = 12;
     private static final int SETTING_HEIGHT = 16;
 
     private static final int BG_COLOR = 0xF01A1A1A;
@@ -60,6 +63,11 @@ public final class ClickGuiScreen extends Screen {
             graphics.drawString(font, message, (width - font.width(message)) / 2, 18, 0xFFFFCC66, true);
         }
 
+        int appearanceX = width - 124;
+        graphics.fill(appearanceX, 12, width - 12, 34, 0xFF252525);
+        graphics.renderOutline(appearanceX, 12, 112, 22, 0xFF454545);
+        graphics.drawString(font, "Appearance  [H]", appearanceX + 9, 19, ACCENT, false);
+
         for (Panel panel : panels) {
             renderPanel(graphics, panel, mouseX, mouseY);
         }
@@ -90,6 +98,14 @@ public final class ClickGuiScreen extends Screen {
             }
 
             moduleY += MODULE_HEIGHT;
+            ScanWindow.Coverage coverage = DataAggregator.getCoverage(module.getId());
+            String coverageText = DataAggregator.isScanning(module.getId())
+                ? String.format("Loaded %d/%d · visited %d", coverage.loaded(), coverage.total(), coverage.visited())
+                : "Scan idle · radius " + module.getScanRadius();
+            graphics.fill(x + 1, moduleY, x + PANEL_WIDTH - 1, moduleY + COVERAGE_HEIGHT, 0xFF191919);
+            graphics.drawString(font, coverageText, x + 9, moduleY + 2, 0xFF9D9D9D, false);
+            moduleY += COVERAGE_HEIGHT;
+
             if (module.isExpanded()) {
                 for (Module.Setting setting : module.getSettings()) {
                     graphics.fill(x + 1, moduleY, x + PANEL_WIDTH - 1,
@@ -107,7 +123,7 @@ public final class ClickGuiScreen extends Screen {
     private int getPanelHeight(Panel panel) {
         int totalHeight = HEADER_HEIGHT;
         for (Module module : ModuleManager.getModulesByCategory(panel.category)) {
-            totalHeight += MODULE_HEIGHT;
+            totalHeight += MODULE_HEIGHT + COVERAGE_HEIGHT;
             if (module.isExpanded()) {
                 totalHeight += module.getSettings().size() * SETTING_HEIGHT;
             }
@@ -125,6 +141,12 @@ public final class ClickGuiScreen extends Screen {
         double mouseY = event.y();
         int button = event.button();
 
+        int appearanceX = width - 124;
+        if (button == 0 && isHovered(mouseX, mouseY, appearanceX, 12, 112, 22)) {
+            Minecraft.getInstance().setScreen(new AppearanceScreen());
+            return true;
+        }
+
         for (Panel panel : panels) {
             if (isHovered(mouseX, mouseY, panel.x, panel.y, PANEL_WIDTH, HEADER_HEIGHT)) {
                 if (button == 0) {
@@ -140,17 +162,19 @@ public final class ClickGuiScreen extends Screen {
                 if (isHovered(mouseX, mouseY, panel.x, moduleY, PANEL_WIDTH, MODULE_HEIGHT)) {
                     if (button == 0) {
                         module.toggle();
+                        Settings.save();
                     } else if (button == 1 && module.hasSettings()) {
                         module.setExpanded(!module.isExpanded());
                     }
                     return true;
                 }
 
-                moduleY += MODULE_HEIGHT;
+                moduleY += MODULE_HEIGHT + COVERAGE_HEIGHT;
                 if (module.isExpanded()) {
                     for (Module.Setting setting : module.getSettings()) {
                         if (isHovered(mouseX, mouseY, panel.x, moduleY, PANEL_WIDTH, SETTING_HEIGHT)) {
                             changeSetting(setting, button);
+                            Settings.save();
                             return true;
                         }
                         moduleY += SETTING_HEIGHT;
@@ -193,6 +217,10 @@ public final class ClickGuiScreen extends Screen {
     public boolean keyPressed(KeyEvent event) {
         if (event.key() == 256) {
             onClose();
+            return true;
+        }
+        if (event.key() == 72) {
+            Minecraft.getInstance().setScreen(new AppearanceScreen());
             return true;
         }
         if (event.key() == 90) {

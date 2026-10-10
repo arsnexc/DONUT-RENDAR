@@ -1,7 +1,7 @@
 package me.kanha.ru.scan;
 
 import me.kanha.ru.RenderUtilClient;
-import me.kanha.ru.config.Settings;
+import me.kanha.ru.module.ActivityScanModule;
 import me.kanha.ru.module.BlockSearchModule;
 import me.kanha.ru.module.Module;
 import me.kanha.ru.module.ModuleManager;
@@ -16,24 +16,27 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 
 import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Bounded, paced scanner for an integrated local world. It never runs against
- * a remote multiplayer level.
+ * Bounded, paced scanner for an integrated local world. Every feature has an
+ * independent scan window and coverage counter; only already-loaded chunks are read.
  */
 public final class DataAggregator {
-    public static final Set<BlockPos> trackedContainers = ConcurrentHashMap.newKeySet();
-    public static final Set<BlockPos> trackedSpawners = ConcurrentHashMap.newKeySet();
+    private static final ChunkResultStore<BlockPos> CONTAINER_RESULTS = new ChunkResultStore<>();
+    private static final ChunkResultStore<BlockPos> SPAWNER_RESULTS = new ChunkResultStore<>();
+    private static final ChunkResultStore<BlockPos> SEARCH_RESULTS = new ChunkResultStore<>();
+
+    public static final Set<BlockPos> trackedContainers = CONTAINER_RESULTS.values();
+    public static final Set<BlockPos> trackedSpawners = SPAWNER_RESULTS.values();
     public static final Map<BlockPos, Float> heatMap = new ConcurrentHashMap<>();
 
-    // Scan the closest chunks first, then continue through the configured window.
-    // A small per-tick budget keeps the full-height chunk walk from monopolizing a tick.
-    private static final int CHUNKS_PER_TICK = 2;
+    private static final int SCAN_JOBS_PER_TICK = 2;
     private static final int COVERAGE_REFRESH_INTERVAL_TICKS = 20;
 
     private static final Set<Block> CONTAINERS = Set.of(
@@ -41,38 +44,48 @@ public final class DataAggregator {
         Blocks.HOPPER, Blocks.DROPPER, Blocks.DISPENSER, Blocks.FURNACE,
         Blocks.BLAST_FURNACE, Blocks.SMOKER
     );
-    private static final Set<Block> ACTIVITY_SIGNALS = Set.of(
-        Blocks.COBBLESTONE, Blocks.STONE_BRICKS, Blocks.DEEPSLATE_BRICKS,
-        Blocks.NETHER_BRICKS, Blocks.BRICKS, Blocks.GLASS, Blocks.WHITE_CONCRETE,
+    private static final Set<Block> WORKSTATIONS = Set.of(
         Blocks.CRAFTING_TABLE, Blocks.BOOKSHELF, Blocks.ENCHANTING_TABLE,
         Blocks.ANVIL, Blocks.CHIPPED_ANVIL, Blocks.DAMAGED_ANVIL,
         Blocks.BREWING_STAND, Blocks.LECTERN, Blocks.LOOM,
         Blocks.CARTOGRAPHY_TABLE, Blocks.FLETCHING_TABLE, Blocks.GRINDSTONE,
-        Blocks.SMITHING_TABLE, Blocks.STONECUTTER, Blocks.COMPOSTER,
-        Blocks.CAMPFIRE, Blocks.SOUL_CAMPFIRE, Blocks.BELL,
+        Blocks.SMITHING_TABLE, Blocks.STONECUTTER, Blocks.COMPOSTER
+    );
+    private static final Set<Block> REDSTONE_SIGNALS = Set.of(
         Blocks.REDSTONE_LAMP, Blocks.REPEATER, Blocks.COMPARATOR,
         Blocks.REDSTONE_TORCH, Blocks.DAYLIGHT_DETECTOR, Blocks.OBSERVER,
         Blocks.NOTE_BLOCK, Blocks.JUKEBOX
     );
+    private static final Set<Block> BUILDING_SIGNALS = Set.of(
+        Blocks.COBBLESTONE, Blocks.STONE_BRICKS, Blocks.DEEPSLATE_BRICKS,
+        Blocks.NETHER_BRICKS, Blocks.BRICKS, Blocks.GLASS, Blocks.WHITE_CONCRETE
+    );
+
+    private static final Map<String, ScanState> SCAN_STATES = new LinkedHashMap<>();
+    private static final Map<ScanWindow.Chunk, Map<ActivityCell, SignalCount>> ACTIVITY_BY_CHUNK = new HashMap<>();
+    private static final Map<ActivityCell, SignalCount> ACTIVITY_TOTALS = new HashMap<>();
 
     private static Object activeLevel;
-    private static List<ChunkOffset> scanOrder = List.of();
-    private static boolean[] visitedChunks = new boolean[0];
-    private static int scanCenterX = Integer.MIN_VALUE;
-    private static int scanCenterZ = Integer.MIN_VALUE;
-    private static int scanRadius = -1;
-    private static int scanCursor;
-    private static int scanModuleMask = -1;
-    private static int visitedChunkCount;
-    private static int loadedChunkCount;
-    private static int coverageRefreshTicks;
-    private static boolean scanningWasActive;
+    private static int moduleCursor;
     private static BlockPos lastSearchPruneOrigin;
     private static double lastSearchPruneRange = Double.NaN;
     private static int lastSearchSelectionRevision = Integer.MIN_VALUE;
+    private static int activityCellSize = 16;
     private static volatile long resultRevision;
 
     private DataAggregator() {
+        throw new AssertionError("No instances");
+    }
+
+    public static Set<BlockPos> getSearchResults() {
+        return SEARCH_RESULTS.values();
+    }
+
+    public static void clearSearchResults() {
+        if (!SEARCH_RESULTS.values().isEmpty()) {
+            SEARCH_RESULTS.clear();
+            resultRevision++;
+        }
     }
 
     public static void tick(Minecraft client) {
@@ -81,234 +94,317 @@ public final class DataAggregator {
             return;
         }
 
-        // ClientLevel identity changes on a dimension/world switch. Do not let
-        // results from the old local level leak into the new one at matching XYZs.
+        // ClientLevel identity changes on a dimension/world switch. Never let results
+        // from the old local level leak into the new one at matching XYZ coordinates.
         if (activeLevel != client.level) {
             clearScanData();
+            CONTAINER_RESULTS.resetForWorld(client.level);
+            SPAWNER_RESULTS.resetForWorld(client.level);
+            SEARCH_RESULTS.resetForWorld(client.level);
             activeLevel = client.level;
         }
 
-        clearDisabledModuleData();
-        pruneSearchResults(client);
-
-        int moduleMask = getEnabledModuleMask();
-        if (moduleMask == 0) {
-            resetScanPlan();
-            scanningWasActive = false;
-            return;
-        }
-
-        int radius = Math.max(1, Math.min(6, Settings.scanRadius));
+        BlockPos playerPos = client.player.blockPosition();
         int centerX = client.player.chunkPosition().x;
         int centerZ = client.player.chunkPosition().z;
         int probeY = getProbeY(client);
+        prepareScanStates(client, centerX, centerZ, probeY);
+        pruneSearchResults(client, playerPos);
+        processScanJobs(client, probeY);
+    }
 
-        if (!scanningWasActive || centerX != scanCenterX || centerZ != scanCenterZ
-            || radius != scanRadius || moduleMask != scanModuleMask) {
-            rebuildScanPlan(client, centerX, centerZ, radius, probeY, moduleMask);
-        } else if (--coverageRefreshTicks <= 0) {
-            loadedChunkCount = countLoadedChunks(client, probeY);
-            coverageRefreshTicks = COVERAGE_REFRESH_INTERVAL_TICKS;
-        }
-        scanningWasActive = true;
+    private static void prepareScanStates(Minecraft client, int centerX, int centerZ, int probeY) {
+        for (Module module : ModuleManager.getAll()) {
+            ScanState state = SCAN_STATES.computeIfAbsent(module.getId(), ignored -> new ScanState());
+            boolean shouldScan = module.isEnabled() && module.isScanEnabled();
+            if (module instanceof BlockSearchModule && BlockSearchModule.searchBlocks.isEmpty()) {
+                shouldScan = false;
+            }
 
-        int candidatesChecked = 0;
-        while (candidatesChecked < CHUNKS_PER_TICK && !scanOrder.isEmpty()) {
-            int index = scanCursor;
-            ChunkOffset offset = scanOrder.get(index);
-            scanCursor = (scanCursor + 1) % scanOrder.size();
-            candidatesChecked++;
-
-            int chunkX = centerX + offset.x();
-            int chunkZ = centerZ + offset.z();
-            if (!isChunkLoaded(client, chunkX, chunkZ, probeY)) {
-                // Do not retain markers for a chunk that has left the client cache.
-                removeChunkResults(chunkX, chunkZ);
+            if (!shouldScan) {
+                if (state.active || hasModuleResults(module.getId())) {
+                    clearModuleResults(module.getId());
+                }
+                state.active = false;
+                state.window = null;
+                state.refreshTicks = 0;
+                state.signature = Long.MIN_VALUE;
                 continue;
             }
 
-            LevelChunk chunk = client.level.getChunk(chunkX, chunkZ);
-            scanChunk(chunk, client);
-            if (!visitedChunks[index]) {
-                visitedChunks[index] = true;
-                visitedChunkCount++;
+            long signature = module instanceof ActivityScanModule activity
+                ? activity.getAggregationSignature() : 0L;
+            boolean changedWindow = state.window == null
+                || state.window.centerX() != centerX
+                || state.window.centerZ() != centerZ
+                || state.window.radius() != module.getScanRadius();
+            boolean changedActivitySettings = module instanceof ActivityScanModule
+                && state.active && state.signature != signature;
+
+            if (!state.active || changedWindow || changedActivitySettings) {
+                if (changedActivitySettings) {
+                    clearModuleResults(module.getId());
+                }
+                state.window = new ScanWindow(centerX, centerZ, module.getScanRadius());
+                state.active = true;
+                state.signature = signature;
+                state.refreshTicks = COVERAGE_REFRESH_INTERVAL_TICKS;
+                refreshLoadedCount(client, state, probeY);
+                pruneResultsOutsideScanWindow(module.getId(), state.window);
+            } else if (--state.refreshTicks <= 0) {
+                refreshLoadedCount(client, state, probeY);
+                state.refreshTicks = COVERAGE_REFRESH_INTERVAL_TICKS;
             }
         }
     }
 
-    private static void rebuildScanPlan(Minecraft client, int centerX, int centerZ, int radius,
-                                        int probeY, int moduleMask) {
-        scanCenterX = centerX;
-        scanCenterZ = centerZ;
-        scanRadius = radius;
-        scanModuleMask = moduleMask;
-        scanCursor = 0;
-        visitedChunkCount = 0;
-
-        ArrayList<ChunkOffset> offsets = new ArrayList<>((radius * 2 + 1) * (radius * 2 + 1));
-        for (int offsetZ = -radius; offsetZ <= radius; offsetZ++) {
-            for (int offsetX = -radius; offsetX <= radius; offsetX++) {
-                offsets.add(new ChunkOffset(offsetX, offsetZ));
-            }
-        }
-        offsets.sort(Comparator
-            .comparingInt((ChunkOffset offset) -> offset.x() * offset.x() + offset.z() * offset.z())
-            .thenComparingInt(offset -> Math.abs(offset.x()) + Math.abs(offset.z()))
-            .thenComparingInt(ChunkOffset::z)
-            .thenComparingInt(ChunkOffset::x));
-        scanOrder = List.copyOf(offsets);
-        visitedChunks = new boolean[scanOrder.size()];
-        loadedChunkCount = countLoadedChunks(client, probeY);
-        coverageRefreshTicks = COVERAGE_REFRESH_INTERVAL_TICKS;
-
-        // Keep retained results scoped to the current scan window. In particular,
-        // shrinking the configured radius must not leave old ESP markers behind.
-        pruneResultsOutsideScanWindow(centerX, centerZ, radius);
-    }
-
-    private static int countLoadedChunks(Minecraft client, int probeY) {
+    private static void refreshLoadedCount(Minecraft client, ScanState state, int probeY) {
         int loaded = 0;
-        for (ChunkOffset offset : scanOrder) {
-            if (isChunkLoaded(client, scanCenterX + offset.x(), scanCenterZ + offset.z(), probeY)) {
+        ScanWindow window = state.window;
+        if (window == null) {
+            return;
+        }
+        for (ScanWindow.Chunk offset : window.orderedOffsets()) {
+            if (isChunkLoaded(client, window.centerX() + offset.x(), window.centerZ() + offset.z(), probeY)) {
                 loaded++;
             }
         }
-        return loaded;
+        window.setLoadedCount(loaded);
+    }
+
+    private static void processScanJobs(Minecraft client, int probeY) {
+        List<Module> modules = ModuleManager.getAll();
+        if (modules.isEmpty()) {
+            return;
+        }
+
+        int jobs = 0;
+        int attempts = 0;
+        int maxAttempts = modules.size() * SCAN_JOBS_PER_TICK;
+        while (jobs < SCAN_JOBS_PER_TICK && attempts < maxAttempts) {
+            Module module = modules.get(Math.floorMod(moduleCursor, modules.size()));
+            moduleCursor = (moduleCursor + 1) % modules.size();
+            attempts++;
+
+            ScanState state = SCAN_STATES.get(module.getId());
+            if (state == null || !state.active || state.window == null) {
+                continue;
+            }
+
+            ScanWindow.Chunk candidate = state.window.nextCandidate();
+            jobs++;
+            if (!isChunkLoaded(client, candidate.x(), candidate.z(), probeY)) {
+                removeChunkResults(module.getId(), candidate.x(), candidate.z());
+                continue;
+            }
+
+            LevelChunk chunk = client.level.getChunk(candidate.x(), candidate.z());
+            scanChunk(module, chunk, client);
+            state.window.markVisited(candidate.x(), candidate.z());
+        }
     }
 
     private static boolean isChunkLoaded(Minecraft client, int chunkX, int chunkZ, int probeY) {
         BlockPos probe = new BlockPos(chunkX * 16 + 8, probeY, chunkZ * 16 + 8);
-        // Check the client cache only; never force-load chunks for scanning.
+        // ClientLevel cache check only; never request or force-load a chunk.
         return client.level.hasChunkAt(probe);
     }
 
     private static int getProbeY(Minecraft client) {
-        // In 1.21.11 getMaxY() is inclusive, so it is used without a -1.
         return Math.max(client.level.getMinY(),
             Math.min(client.level.getMaxY(), client.player.blockPosition().getY()));
     }
 
-    private static void scanChunk(LevelChunk chunk, Minecraft client) {
+    private static void scanChunk(Module module, LevelChunk chunk, Minecraft client) {
+        String moduleId = module.getId();
         int chunkX = chunk.getPos().x;
         int chunkZ = chunk.getPos().z;
-        removeChunkResults(chunkX, chunkZ);
 
-        boolean scanContainers = isEnabled("Container ESP");
-        boolean scanSpawners = isEnabled("Spawner ESP");
-        Module searchBase = ModuleManager.getByName("Block Search");
-        BlockSearchModule searchModule = searchBase instanceof BlockSearchModule search ? search : null;
-        boolean scanSearch = searchModule != null && searchModule.isEnabled()
-            && !BlockSearchModule.searchBlocks.isEmpty();
-        double searchRangeSquared = searchModule == null ? 0.0 : searchModule.getRange() * searchModule.getRange();
-        boolean scanActivity = isEnabled("Activity Scan");
-        if (!scanContainers && !scanSpawners && !scanSearch && !scanActivity) {
-            resultRevision++;
+        switch (moduleId) {
+            case "container_esp" -> scanContainers(chunk);
+            case "spawner_esp" -> scanSpawners(chunk);
+            case "block_search" -> scanSearch(chunk, client);
+            case "activity_scan" -> scanActivity(chunk, module instanceof ActivityScanModule activity
+                ? activity : null);
+            default -> removeChunkResults(moduleId, chunkX, chunkZ);
+        }
+        resultRevision++;
+    }
+
+    private static void scanContainers(LevelChunk chunk) {
+        int chunkX = chunk.getPos().x;
+        int chunkZ = chunk.getPos().z;
+        ArrayList<BlockPos> found = new ArrayList<>();
+        walkChunk(chunk, (state, block, pos) -> {
+            if (CONTAINERS.contains(block) || block instanceof ShulkerBoxBlock
+                || state.is(BlockTags.COPPER_CHESTS)) {
+                found.add(pos);
+            }
+        });
+        CONTAINER_RESULTS.replaceChunk(chunkX, chunkZ, found);
+    }
+
+    private static void scanSpawners(LevelChunk chunk) {
+        int chunkX = chunk.getPos().x;
+        int chunkZ = chunk.getPos().z;
+        ArrayList<BlockPos> found = new ArrayList<>();
+        walkChunk(chunk, (state, block, pos) -> {
+            if (block == Blocks.SPAWNER) {
+                found.add(pos);
+            }
+        });
+        SPAWNER_RESULTS.replaceChunk(chunkX, chunkZ, found);
+    }
+
+    private static void scanSearch(LevelChunk chunk, Minecraft client) {
+        BlockSearchModule searchModule = ModuleManager.getByName("Block Search") instanceof BlockSearchModule search
+            ? search : null;
+        if (searchModule == null || !searchModule.isEnabled() || !searchModule.isScanEnabled()) {
+            SEARCH_RESULTS.removeChunk(chunk.getPos().x, chunk.getPos().z);
             return;
         }
 
         BlockPos playerPos = client.player.blockPosition();
-        int hottestSectionCount = 0;
-        BlockPos hottestSectionCenter = null;
+        double rangeSquared = searchModule.getRange() * searchModule.getRange();
+        ArrayList<BlockPos> found = new ArrayList<>();
+        walkChunk(chunk, (state, block, pos) -> {
+            if (BlockSearchModule.shouldTrack(block) && playerPos.distSqr(pos) <= rangeSquared) {
+                found.add(pos);
+            }
+        });
+        SEARCH_RESULTS.replaceChunk(chunk.getPos().x, chunk.getPos().z, found);
+    }
+
+    private static void scanActivity(LevelChunk chunk, ActivityScanModule activity) {
+        int chunkX = chunk.getPos().x;
+        int chunkZ = chunk.getPos().z;
+        ScanWindow.Chunk chunkKey = new ScanWindow.Chunk(chunkX, chunkZ);
+        removeActivityChunk(chunkKey);
+        if (activity == null) {
+            return;
+        }
+
+        activityCellSize = activity.getCellSize();
+        Map<ActivityCell, SignalCount> localCells = new HashMap<>();
+        walkChunk(chunk, (state, block, pos) -> {
+            ActivityScanModule.Signal signal = classifyActivitySignal(state, block);
+            if (signal == null) {
+                return;
+            }
+            float weight = activity.getWeight(signal);
+            if (weight <= 0.0f) {
+                return;
+            }
+
+            ActivityCell cell = new ActivityCell(
+                Math.floorDiv(pos.getX(), activityCellSize),
+                Math.floorDiv(pos.getY(), 16),
+                Math.floorDiv(pos.getZ(), activityCellSize)
+            );
+            localCells.computeIfAbsent(cell, ignored -> new SignalCount()).add(weight);
+        });
+
+        if (!localCells.isEmpty()) {
+            ACTIVITY_BY_CHUNK.put(chunkKey, localCells);
+            for (Map.Entry<ActivityCell, SignalCount> entry : localCells.entrySet()) {
+                SignalCount total = ACTIVITY_TOTALS.computeIfAbsent(entry.getKey(), ignored -> new SignalCount());
+                total.add(entry.getValue());
+                publishActivityCell(entry.getKey(), total, activityCellSize, activity.getNoiseFloor());
+            }
+        }
+    }
+
+    private static void walkChunk(LevelChunk chunk, BlockVisitor visitor) {
         int baseX = chunk.getPos().getMinBlockX();
         int baseZ = chunk.getPos().getMinBlockZ();
         LevelChunkSection[] sections = chunk.getSections();
-
         for (int sectionIndex = 0; sectionIndex < sections.length; sectionIndex++) {
             LevelChunkSection section = sections[sectionIndex];
             if (section == null || section.hasOnlyAir()) {
                 continue;
             }
-
             int sectionBaseY = chunk.getMinSectionY() * 16 + sectionIndex * 16;
-            int activityCount = 0;
-            long activityX = 0;
-            long activityY = 0;
-            long activityZ = 0;
-
             for (int x = 0; x < 16; x++) {
                 for (int y = 0; y < 16; y++) {
                     for (int z = 0; z < 16; z++) {
                         BlockState state = section.getBlockState(x, y, z);
-                        if (state.isAir()) {
-                            continue;
-                        }
-
-                        Block block = state.getBlock();
-                        BlockPos pos = new BlockPos(baseX + x, sectionBaseY + y, baseZ + z);
-
-                        if (scanContainers && (CONTAINERS.contains(block)
-                            || block instanceof ShulkerBoxBlock || state.is(BlockTags.COPPER_CHESTS))) {
-                            trackedContainers.add(pos);
-                        }
-                        if (scanSpawners && block == Blocks.SPAWNER) {
-                            trackedSpawners.add(pos);
-                        }
-                        if (scanActivity && isActivityIndicator(state, block)) {
-                            activityCount++;
-                            activityX += pos.getX();
-                            activityY += pos.getY();
-                            activityZ += pos.getZ();
-                        }
-                        if (scanSearch && BlockSearchModule.shouldTrack(block)
-                            && playerPos.distSqr(pos) <= searchRangeSquared) {
-                            BlockSearchModule.foundBlocks.add(pos);
+                        if (!state.isAir()) {
+                            Block block = state.getBlock();
+                            visitor.visit(state, block, new BlockPos(baseX + x, sectionBaseY + y, baseZ + z));
                         }
                     }
                 }
             }
+        }
+    }
 
-            // Keep each hotspot at the busiest observed vertical section and at
-            // the average coordinates of its signal blocks, not at player Y.
-            if (scanActivity && activityCount > hottestSectionCount) {
-                hottestSectionCount = activityCount;
-                hottestSectionCenter = new BlockPos(
-                    averageCoordinate(activityX, activityCount),
-                    averageCoordinate(activityY, activityCount),
-                    averageCoordinate(activityZ, activityCount)
-                );
+    private static ActivityScanModule.Signal classifyActivitySignal(BlockState state, Block block) {
+        if (CONTAINERS.contains(block) || block instanceof ShulkerBoxBlock || state.is(BlockTags.COPPER_CHESTS)) {
+            return ActivityScanModule.Signal.STORAGE;
+        }
+        if (REDSTONE_SIGNALS.contains(block)) {
+            return ActivityScanModule.Signal.REDSTONE;
+        }
+        if (WORKSTATIONS.contains(block)) {
+            return ActivityScanModule.Signal.WORKSTATION;
+        }
+        if (block == Blocks.BELL || block == Blocks.CAMPFIRE || block == Blocks.SOUL_CAMPFIRE
+            || state.is(BlockTags.BEDS) || state.is(BlockTags.WOOL) || state.is(BlockTags.WOOL_CARPETS)
+            || state.is(BlockTags.ALL_SIGNS) || state.is(BlockTags.BANNERS)
+            || state.is(BlockTags.LANTERNS) || state.is(BlockTags.CANDLES)
+            || state.is(BlockTags.DOORS) || state.is(BlockTags.TRAPDOORS)) {
+            return ActivityScanModule.Signal.DOMESTIC;
+        }
+        if (BUILDING_SIGNALS.contains(block) || state.is(BlockTags.PLANKS)
+            || state.is(BlockTags.STONE_BRICKS) || state.is(BlockTags.STAIRS)
+            || state.is(BlockTags.SLABS) || state.is(BlockTags.WALLS)
+            || state.is(BlockTags.FENCES) || state.is(BlockTags.RAILS)) {
+            return ActivityScanModule.Signal.BUILDING;
+        }
+        return null;
+    }
+
+    private static void publishActivityCell(ActivityCell cell, SignalCount total, int cellSize, int noiseFloor) {
+        BlockPos displayPosition = cell.toBlockPos(cellSize);
+        if (total.signals < noiseFloor || total.signals == 0) {
+            heatMap.remove(displayPosition);
+        } else {
+            heatMap.put(displayPosition, (float) total.score);
+        }
+    }
+
+    private static void removeActivityChunk(ScanWindow.Chunk chunkKey) {
+        Map<ActivityCell, SignalCount> removed = ACTIVITY_BY_CHUNK.remove(chunkKey);
+        if (removed == null) {
+            return;
+        }
+        for (Map.Entry<ActivityCell, SignalCount> entry : removed.entrySet()) {
+            SignalCount total = ACTIVITY_TOTALS.get(entry.getKey());
+            if (total == null) {
+                continue;
+            }
+            total.subtract(entry.getValue());
+            if (total.signals <= 0) {
+                ACTIVITY_TOTALS.remove(entry.getKey());
+                heatMap.remove(entry.getKey().toBlockPos(activityCellSize));
+            } else {
+                publishActivityCell(entry.getKey(), total, activityCellSize, currentActivityNoiseFloor());
             }
         }
-
-        if (scanActivity && hottestSectionCenter != null) {
-            heatMap.put(hottestSectionCenter, (float) hottestSectionCount);
-        }
-        resultRevision++;
     }
 
-    private static boolean isActivityIndicator(BlockState state, Block block) {
-        return ACTIVITY_SIGNALS.contains(block)
-            || CONTAINERS.contains(block)
-            || block instanceof ShulkerBoxBlock
-            || state.is(BlockTags.COPPER_CHESTS)
-            || state.is(BlockTags.PLANKS)
-            || state.is(BlockTags.STONE_BRICKS)
-            || state.is(BlockTags.STAIRS)
-            || state.is(BlockTags.SLABS)
-            || state.is(BlockTags.WALLS)
-            || state.is(BlockTags.FENCES)
-            || state.is(BlockTags.DOORS)
-            || state.is(BlockTags.TRAPDOORS)
-            || state.is(BlockTags.BEDS)
-            || state.is(BlockTags.WOOL)
-            || state.is(BlockTags.WOOL_CARPETS)
-            || state.is(BlockTags.RAILS)
-            || state.is(BlockTags.ALL_SIGNS)
-            || state.is(BlockTags.BANNERS)
-            || state.is(BlockTags.LANTERNS)
-            || state.is(BlockTags.CANDLES)
-            || state.is(BlockTags.SHULKER_BOXES);
+    private static int currentActivityNoiseFloor() {
+        Module module = ModuleManager.getByName("Activity Scan");
+        return module instanceof ActivityScanModule activity ? activity.getNoiseFloor() : 0;
     }
 
-    private static int averageCoordinate(long sum, int count) {
-        return (int) Math.round((double) sum / count);
-    }
-
-    private static void pruneSearchResults(Minecraft client) {
-        Module searchBase = ModuleManager.getByName("Block Search");
-        if (!(searchBase instanceof BlockSearchModule searchModule)
-            || !searchModule.isEnabled() || BlockSearchModule.searchBlocks.isEmpty()) {
-            if (!BlockSearchModule.foundBlocks.isEmpty()) {
-                BlockSearchModule.clearFound();
+    private static void pruneSearchResults(Minecraft client, BlockPos playerPos) {
+        Module base = ModuleManager.getByName("Block Search");
+        if (!(base instanceof BlockSearchModule searchModule)
+            || !searchModule.isEnabled() || !searchModule.isScanEnabled()
+            || BlockSearchModule.searchBlocks.isEmpty()) {
+            if (!SEARCH_RESULTS.values().isEmpty()) {
+                SEARCH_RESULTS.clear();
                 resultRevision++;
             }
             lastSearchPruneOrigin = null;
@@ -317,7 +413,6 @@ public final class DataAggregator {
             return;
         }
 
-        BlockPos playerPos = client.player.blockPosition();
         double range = searchModule.getRange();
         int selectionRevision = BlockSearchModule.getSelectionRevision();
         boolean rangeOrPositionChanged = !playerPos.equals(lastSearchPruneOrigin)
@@ -328,13 +423,12 @@ public final class DataAggregator {
         }
 
         double rangeSquared = range * range;
-        boolean changed = BlockSearchModule.foundBlocks.removeIf(pos -> {
+        boolean changed = SEARCH_RESULTS.removeIf(pos -> {
             if (playerPos.distSqr(pos) > rangeSquared) {
                 return true;
             }
-            // Validate block state only when the search selection changes. Normal
-            // world edits are handled by the fast chunk rescan; this avoids walking
-            // every result and querying block state on every render tick.
+            // Block edits are picked up during a chunk rescan. Selection changes
+            // also validate retained positions without forcing an unloaded chunk.
             return selectionChanged && (!client.level.hasChunkAt(pos)
                 || !BlockSearchModule.shouldTrack(client.level.getBlockState(pos).getBlock()));
         });
@@ -347,120 +441,116 @@ public final class DataAggregator {
         lastSearchSelectionRevision = selectionRevision;
     }
 
-    private static void removeChunkResults(int chunkX, int chunkZ) {
-        boolean changed = trackedContainers.removeIf(
-            pos -> (pos.getX() >> 4) == chunkX && (pos.getZ() >> 4) == chunkZ);
-        changed |= trackedSpawners.removeIf(
-            pos -> (pos.getX() >> 4) == chunkX && (pos.getZ() >> 4) == chunkZ);
-        changed |= BlockSearchModule.foundBlocks.removeIf(
-            pos -> (pos.getX() >> 4) == chunkX && (pos.getZ() >> 4) == chunkZ);
-        changed |= heatMap.keySet().removeIf(
-            pos -> (pos.getX() >> 4) == chunkX && (pos.getZ() >> 4) == chunkZ);
+    private static void pruneResultsOutsideScanWindow(String moduleId, ScanWindow window) {
+        boolean changed = switch (moduleId) {
+            case "container_esp" -> CONTAINER_RESULTS.pruneOutside(window);
+            case "spawner_esp" -> SPAWNER_RESULTS.pruneOutside(window);
+            case "block_search" -> SEARCH_RESULTS.pruneOutside(window);
+            case "activity_scan" -> pruneActivityOutside(window);
+            default -> false;
+        };
         if (changed) {
             resultRevision++;
         }
     }
 
-    private static void pruneResultsOutsideScanWindow(int centerX, int centerZ, int radius) {
-        boolean changed = trackedContainers.removeIf(pos -> !withinChunkRadius(pos, centerX, centerZ, radius));
-        changed |= trackedSpawners.removeIf(pos -> !withinChunkRadius(pos, centerX, centerZ, radius));
-        changed |= BlockSearchModule.foundBlocks.removeIf(pos -> !withinChunkRadius(pos, centerX, centerZ, radius));
-        changed |= heatMap.keySet().removeIf(pos -> !withinChunkRadius(pos, centerX, centerZ, radius));
+    private static boolean pruneActivityOutside(ScanWindow window) {
+        ArrayList<ScanWindow.Chunk> outside = new ArrayList<>();
+        for (ScanWindow.Chunk chunk : ACTIVITY_BY_CHUNK.keySet()) {
+            if (!window.contains(chunk.x(), chunk.z())) {
+                outside.add(chunk);
+            }
+        }
+        if (outside.isEmpty()) {
+            return false;
+        }
+        outside.forEach(DataAggregator::removeActivityChunk);
+        return true;
+    }
+
+    private static void removeChunkResults(String moduleId, int chunkX, int chunkZ) {
+        boolean changed = switch (moduleId) {
+            case "container_esp" -> CONTAINER_RESULTS.removeChunk(chunkX, chunkZ);
+            case "spawner_esp" -> SPAWNER_RESULTS.removeChunk(chunkX, chunkZ);
+            case "block_search" -> SEARCH_RESULTS.removeChunk(chunkX, chunkZ);
+            case "activity_scan" -> {
+                ScanWindow.Chunk key = new ScanWindow.Chunk(chunkX, chunkZ);
+                boolean hadResults = ACTIVITY_BY_CHUNK.containsKey(key);
+                removeActivityChunk(key);
+                yield hadResults;
+            }
+            default -> false;
+        };
         if (changed) {
             resultRevision++;
         }
     }
 
-    private static boolean withinChunkRadius(BlockPos pos, int centerX, int centerZ, int radius) {
-        return Math.abs((pos.getX() >> 4) - centerX) <= radius
-            && Math.abs((pos.getZ() >> 4) - centerZ) <= radius;
-    }
-
-    private static void clearDisabledModuleData() {
-        boolean changed = false;
-        if (!isEnabled("Container ESP")) {
-            changed |= !trackedContainers.isEmpty();
-            trackedContainers.clear();
-        }
-        if (!isEnabled("Spawner ESP")) {
-            changed |= !trackedSpawners.isEmpty();
-            trackedSpawners.clear();
-        }
-        if (!isEnabled("Block Search")) {
-            changed |= !BlockSearchModule.foundBlocks.isEmpty();
-            BlockSearchModule.clearFound();
-        }
-        if (!isEnabled("Activity Scan")) {
-            changed |= !heatMap.isEmpty();
-            heatMap.clear();
-        }
+    private static void clearModuleResults(String moduleId) {
+        boolean changed = switch (moduleId) {
+            case "container_esp" -> clearStore(CONTAINER_RESULTS);
+            case "spawner_esp" -> clearStore(SPAWNER_RESULTS);
+            case "block_search" -> clearStore(SEARCH_RESULTS);
+            case "activity_scan" -> clearActivityResults();
+            default -> false;
+        };
         if (changed) {
             resultRevision++;
         }
     }
 
-    private static int getEnabledModuleMask() {
-        int mask = 0;
-        if (isEnabled("Container ESP")) {
-            mask |= 1;
-        }
-        if (isEnabled("Spawner ESP")) {
-            mask |= 1 << 1;
-        }
-        if (isEnabled("Block Search")) {
-            mask |= 1 << 2;
-        }
-        if (isEnabled("Activity Scan")) {
-            mask |= 1 << 3;
-        }
-        return mask;
+    private static boolean hasModuleResults(String moduleId) {
+        return switch (moduleId) {
+            case "container_esp" -> !CONTAINER_RESULTS.values().isEmpty();
+            case "spawner_esp" -> !SPAWNER_RESULTS.values().isEmpty();
+            case "block_search" -> !SEARCH_RESULTS.values().isEmpty();
+            case "activity_scan" -> !heatMap.isEmpty() || !ACTIVITY_BY_CHUNK.isEmpty();
+            default -> false;
+        };
     }
 
-    private static boolean isEnabled(String name) {
-        Module module = ModuleManager.getByName(name);
-        return module != null && module.isEnabled();
+    private static boolean clearStore(ChunkResultStore<BlockPos> store) {
+        if (store.values().isEmpty()) {
+            return false;
+        }
+        store.clear();
+        return true;
     }
 
-    private static void resetScanPlan() {
-        scanOrder = List.of();
-        visitedChunks = new boolean[0];
-        scanCenterX = Integer.MIN_VALUE;
-        scanCenterZ = Integer.MIN_VALUE;
-        scanRadius = -1;
-        scanCursor = 0;
-        scanModuleMask = -1;
-        visitedChunkCount = 0;
-        loadedChunkCount = 0;
-        coverageRefreshTicks = 0;
+    private static boolean clearActivityResults() {
+        boolean changed = !heatMap.isEmpty() || !ACTIVITY_BY_CHUNK.isEmpty() || !ACTIVITY_TOTALS.isEmpty();
+        heatMap.clear();
+        ACTIVITY_BY_CHUNK.clear();
+        ACTIVITY_TOTALS.clear();
+        return changed;
     }
 
     private static void clearScanData() {
-        trackedContainers.clear();
-        trackedSpawners.clear();
+        CONTAINER_RESULTS.clear();
+        SPAWNER_RESULTS.clear();
+        SEARCH_RESULTS.clear();
         heatMap.clear();
-        BlockSearchModule.clearFound();
+        ACTIVITY_BY_CHUNK.clear();
+        ACTIVITY_TOTALS.clear();
+        SCAN_STATES.clear();
+        moduleCursor = 0;
         resultRevision++;
-        resetScanPlan();
-        scanningWasActive = false;
         lastSearchPruneOrigin = null;
         lastSearchPruneRange = Double.NaN;
         lastSearchSelectionRevision = Integer.MIN_VALUE;
     }
 
-    public static int getLoadedChunkCount() {
-        return loadedChunkCount;
+    public static ScanWindow.Coverage getCoverage(String moduleId) {
+        ScanState state = SCAN_STATES.get(moduleId);
+        return state == null || !state.active || state.window == null
+            ? new ScanWindow.Coverage(0, 0, 0) : state.window.coverage();
     }
 
-    public static int getTotalChunkCount() {
-        return scanOrder.size();
+    public static boolean isScanning(String moduleId) {
+        ScanState state = SCAN_STATES.get(moduleId);
+        return state != null && state.active && state.window != null;
     }
 
-    /** Number of chunks visited at least once for the current center/radius. */
-    public static int getVisitedChunkCount() {
-        return visitedChunkCount;
-    }
-
-    /** Changes when scan results are refreshed, pruned, or cleared. */
     public static long getResultRevision() {
         return resultRevision;
     }
@@ -470,6 +560,43 @@ public final class DataAggregator {
         activeLevel = null;
     }
 
-    private record ChunkOffset(int x, int z) {
+    private record ActivityCell(int xCell, int ySection, int zCell) {
+        private BlockPos toBlockPos(int cellSize) {
+            return new BlockPos(xCell * cellSize + cellSize / 2,
+                ySection * 16 + 8,
+                zCell * cellSize + cellSize / 2);
+        }
+    }
+
+    private static final class SignalCount {
+        private double score;
+        private int signals;
+
+        private void add(float weight) {
+            score += weight;
+            signals++;
+        }
+
+        private void add(SignalCount other) {
+            score += other.score;
+            signals += other.signals;
+        }
+
+        private void subtract(SignalCount other) {
+            score -= other.score;
+            signals -= other.signals;
+        }
+    }
+
+    private static final class ScanState {
+        private ScanWindow window;
+        private boolean active;
+        private int refreshTicks;
+        private long signature = Long.MIN_VALUE;
+    }
+
+    @FunctionalInterface
+    private interface BlockVisitor {
+        void visit(BlockState state, Block block, BlockPos pos);
     }
 }
