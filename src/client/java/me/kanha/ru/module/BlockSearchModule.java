@@ -9,6 +9,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class BlockSearchModule extends Module {
     public static final Set<Block> searchBlocks = ConcurrentHashMap.newKeySet();
     public static final Set<BlockPos> foundBlocks = ConcurrentHashMap.newKeySet();
+    private static int selectionRevision;
 
     private final BooleanSetting highlight = new BooleanSetting("Highlight", true);
     private final NumberSetting range = new NumberSetting("Range", 64, 16, 256, 16);
@@ -37,11 +38,19 @@ public final class BlockSearchModule extends Module {
     }
 
     public static void addBlock(Block block) {
-        searchBlocks.add(block);
+        if (searchBlocks.add(block)) {
+            selectionRevision++;
+        }
     }
 
     public static void removeBlock(Block block) {
-        searchBlocks.remove(block);
+        if (searchBlocks.remove(block)) {
+            selectionRevision++;
+        }
+    }
+
+    public static int getSelectionRevision() {
+        return selectionRevision;
     }
 
     public static void clearFound() {
